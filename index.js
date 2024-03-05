@@ -1,69 +1,106 @@
 import fs from "fs";
-import { spawn, exec } from "child_process";
+import { EventEmitter } from "events";
+import util from "util";
 
-function buf_match(prev, cur) {
-  if (prev.length !== cur.length) return false;
+const stat = util.promisify(fs.stat);
+const tasks = new Map();
 
-  for (let i = 0; i < prev; i++) {
-    if (prev[i] !== cur[i]) return false;
-  }
+const register = (main, prop, listener) =>
+  (main[prop] = new Set(
+    main[prop] instanceof Set ? main[prop] : [main[prop]]
+  ).add(listener));
 
-  return true;
-}
+const walk = (val, fn) => (val instanceof Set ? val.forEach(fn) : fn(val));
 
-function watch_file(path, cb) {
-  const bufs = {};
-  const tick_time = 10;
-  let child = null;
+const isFileModified = (curr, prev) => {
+  const currmTime = curr.mtimeMs;
+  return curr.size !== prev.size || currmTime > prev.mtimeMs || currmTime === 0;
+};
 
-  function watch() {
-    const cur_buf = fs.readFileSync(path);
-    const current_mf_time = Date.now();
+const createTask = (path, listener, notifier) => {
+  const task = {
+    listeners: listener,
+    notifiers: notifier,
+    watcher: fs.watchFile(path, (curr, prev) => {
+      walk(task.notifiers, (notifier) => notifier("changed file"));
 
-    if (!bufs[path]) {
-      bufs[path] = {
-        prev: null,
-        cur: { data: cur_buf, modified_time: current_mf_time },
-      };
-    } else {
-      const buf = bufs[path];
-      buf.prev = buf.cur;
-      buf.cur = { data: cur_buf, modified_time: current_mf_time };
-
-      if (!buf_match(buf.prev.data, buf.cur.data)) {
-        if (child) {
-          child.kill("SIGTERM");
-          exec(`kill ${child.pid}`);
-        }
-
-        child = exec(`node ${path}`, (error, stdout, stderr) => {
-          if (error) {
-            console.error(`Error executing command: ${error.message}`);
-            return;
-          }
-          if (stderr) {
-            console.error(`Command stderr: ${stderr}`);
-            return;
-          }
-          console.log(stdout);
-        });
-
-        child.on("exit", (code, signal) => {
-          console.log(
-            `Child process exited with code ${code} and signal ${signal}`
-          );
-          child = null;
-        });
-
-        if (cb) {
-          cb({ time: buf.prev.modified_time }, { time: current_mf_time });
-        }
+      if (isFileModified(curr, prev)) {
+        walk(task.listeners, (listener) => listener(path, curr));
       }
-    }
-  }
+    }),
+  };
 
-  watch();
-  setInterval(watch, tick_time);
+  return task;
+};
+
+function watchFile(path, { listener, notifier }) {
+  const task = tasks.get(path);
+
+  if (task) {
+    register(task, "listeners", listener);
+    register(task, "notifiers", notifier);
+  } else {
+    tasks.set(path, createTask(path, listener, notifier));
+  }
 }
 
-watch_file("test.js");
+function watcherApi(bus) {
+  const watch = (path, listener) => {
+    let closer;
+
+    closer = watchFile(path, {
+      listener,
+      notifier: (ev, payload) => bus.emit(ev, payload),
+    });
+
+    return closer;
+  };
+
+  const monitor = (file, stats) => {
+    let prevStats = stats;
+
+    const listener = async (path, newStats) => {
+      try {
+        const newStats = await stat(file);
+        const at = newStats.atimeMs;
+        const mt = newStats.mtimeMs;
+
+        if (!at || at <= mt || mt !== prevStats.mtimeMs) {
+          bus.emit("change", file);
+        }
+      } catch (error) {
+        console.log(error);
+      }
+    };
+
+    watch(file, listener);
+  };
+
+  const add = async (path) => {
+    const stats = await stat(path);
+
+    if (stats.isFile()) monitor(path, stats);
+  };
+
+  return {
+    add,
+  };
+}
+
+function watch() {
+  const dirs = [];
+
+  const cwd = process.cwd();
+  if (!dirs.length) dirs.unshift(`${cwd}/teste.js`);
+
+  const bus = new EventEmitter();
+  const api = watcherApi(bus);
+
+  dirs.forEach((dir) => api.add(dir));
+
+  return bus;
+}
+
+watch().on("change", (file) => {
+  console.log("file changed: ", file);
+});
