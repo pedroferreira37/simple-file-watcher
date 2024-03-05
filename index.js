@@ -91,7 +91,7 @@ function watch() {
   const dirs = [];
 
   const cwd = process.cwd();
-  if (!dirs.length) dirs.unshift(`${cwd}/teste.js`);
+  if (!dirs.length) dirs.unshift(`${cwd}/teste.txt`);
 
   const bus = new EventEmitter();
   const api = watcherApi(bus);
